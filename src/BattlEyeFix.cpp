@@ -14,6 +14,10 @@
 //     instead of the server crashing.
 //  2. Notice. The kicked player only sees "Connection lost", so a BattlEye kick first shows them a message box
 //     with the reason and how to fix it, and the kick itself follows 3 seconds later.
+//  3. Monitor. Every BattlEye kick is classified against the player's own BattlEye traffic, and
+//     BattlEyeFix.status.json / BattlEyeFix.events.jsonl show when BattlEye's servers are rejecting valid players.
+//  4. Re-check (only with BattlEyeFix.recheck). A suspected false kick is held, and the player is registered with
+//     BattlEye again for a fresh check, until one passes or the time limit runs out.
 //
 // Nothing else in the game is changed. Every address is found at startup from the game's own code and
 // checked; if anything doesn't match exactly (for example after a game update), the patch logs why and
@@ -22,8 +26,11 @@
 // Hooking uses MinHook 1.3.4 (third_party/minhook, BSD 2-clause).
 #include "Engine.h"
 #include "../third_party/minhook/include/MinHook.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
+#include <fstream>
 #include <bcrypt.h>
 #include <deque>
 #include <iomanip>
@@ -972,15 +979,27 @@ uintptr_t ValidatedInstance(uintptr_t *gameSessionOut = nullptr) {
         *gameSessionOut = gameSession;
     return instance;
 }
+bool ClassifyKick(int player, const std::string &reason);
+extern int recheckKickPlayer;
+bool lastKickHeld = false; // game thread only: the last guarded kick was held instead of carried out
 void RunOriginalKick(int player, const char *reason, const std::string &why) {
     bool gameThread = GetCurrentThreadId() == gameThreadId;
     if (gameThread) {
         inBattlEyeKick = true;
         kickReason = why;
+        recheckKickPlayer = -1;
+        try {
+            if (ClassifyKick(player, why))
+                recheckKickPlayer = player;
+        } catch (const std::exception &e) {
+            Write(std::string("BattlEye kick classification failed: ") + e.what());
+        }
     }
     originalBattlEyeKick(player, reason);
-    if (gameThread)
+    if (gameThread) {
         inBattlEyeKick = false;
+        recheckKickPlayer = -1;
+    }
 }
 void BattlEyeKickHook(int player, const char *reason) {
     std::string why;
@@ -1007,9 +1026,10 @@ void BattlEyeKickHook(int player, const char *reason) {
         return;
     }
     *slot = instance;
+    lastKickHeld = false;
     RunOriginalKick(player, reason, why);
     *slot = 0;
-    Write(label + "kicked safely");
+    Write(label + (lastKickHeld ? "handled safely, held for a re-check" : "kicked safely"));
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -1030,8 +1050,18 @@ std::string KickNotice(const std::string &reason) {
                "then Install_BattlEye.bat";
     return text + "\n\nYou will be disconnected in a few seconds.";
 }
+void HoldForRecheck(void *controller, int player);
 // Game thread. Only kicks made by the BattlEye callback are held; every other kick goes straight through.
 bool KickPlayerHook(void *session, void *controller, const void *reason) {
+    if (inBattlEyeKick && recheckKickPlayer >= 0 && GetCurrentThreadId() == gameThreadId)
+        try {
+            HoldForRecheck(controller, recheckKickPlayer);
+            lastKickHeld = true;
+            Write("BattlEye kick held for a re-check (" + kickReason + ")");
+            return true;
+        } catch (const std::exception &e) {
+            Write(std::string("BattlEye re-check hold failed, kicking as normal: ") + e.what());
+        }
     if (!inBattlEyeKick || noticeOff || GetCurrentThreadId() != gameThreadId)
         return originalKickPlayer(session, controller, reason);
     try {
@@ -1066,16 +1096,581 @@ void HeldKickTick() {
         }
     }
 }
+// ---------------------------------------------------------------------------------------------------------
+// BattlEye monitor and re-check.
+//
+// On 14 November 2026 BattlEye's central servers rejected valid players in windows that switched for every
+// Conan server at once. The player's BattlEye answered the join check (a ~926-byte reply), the server passed it
+// on to BattlEye, and about 0.5 s later BattlEye sent back a kick with the misleading reason "Client not
+// responding". A real "not responding" kick has no such reply just before it.
+//
+// Monitor (always on): every BattlEye kick is classified and logged, and BattlEyeFix.status.json shows whether
+// BattlEye looks healthy or degraded. BattlEyeFix.events.jsonl gets one line per event.
+// Re-check (off unless BattlEyeFix.recheck exists): a suspected false kick is not carried out. The player is
+// taken off BattlEye and registered again after retrySeconds, so BattlEye runs a fresh check, until one passes or
+// holdSeconds runs out and the player is kicked as normal. While held, the player isn't protected by BattlEye.
+// Lines in BattlEyeFix.recheck (key=value) override the defaults in RecheckSettings.
+//
+// BattlEye's server interface lives in a table the game fills when BattlEye loads: AddPlayer(id, ip, port,
+// name), ChangePlayerStatus(id, status), ReceivedPacket(id, data, size). The game's own register (by
+// controller), unregister (by unique net id) and login step (unique net id -> controller) are reused.
+using BeReceivedPacket = void (*)(int, const void *, int);
+using BeAddPlayer = void (*)(int, unsigned long, unsigned short, const char *);
+using BeUnregister = void (*)(const void *);
+using BeRegister = void (*)(void *);
+using BeAddUniqueId = void (*)(const void *, void *);
+uintptr_t beReceivedSlot{}, beAddPlayerSlot{};
+BeReceivedPacket originalBeReceived{};
+BeAddPlayer originalBeAddPlayer{};
+BeUnregister beUnregister{};
+BeRegister beRegister{};
+BeAddUniqueId beAddUniqueId{};
+struct RecheckSettings {
+    bool hold = false;
+    int minReplyBytes = 500;    // a reply at least this big counts as "the player's BattlEye answered"
+    int replyWindowMs = 2000;   // ...if it arrived this soon before the kick
+    int firstCheckSeconds = 90; // only kicks this soon after registering (the join check) qualify
+    int retrySeconds = 30;      // wait before registering again
+    int holdSeconds = 1200;     // give up and kick as normal after this long
+    int degradedKicks = 3;      // suspected false kicks within degradedWindowSeconds that mean "degraded"
+    int degradedWindowSeconds = 600;
+    bool notify = true; // tell held players what is going on
+};
+std::mutex settingsMutex;
+RecheckSettings settings;
+RecheckSettings CurrentSettings() {
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    return settings;
+}
+struct BeTrace {
+    uint64_t registeredAt{}, lastReplyAt{};
+    int lastReplyBytes{}, largestReply{};
+    uint64_t packets{};
+    bool kicked{}, passed{};
+};
+std::map<int, BeTrace> beTraces; // game thread only
+struct Recheck {
+    Handle controller;
+    uint64_t firstAt{}, unregisteredAt{};
+    int pid{-1}, attempts{};
+    bool unregistered{}, registered{};
+};
+std::deque<Recheck> rechecks;  // game thread only
+Recheck *beRegistering{};      // game thread only
+int recheckKickPlayer = -1;    // game thread only
+std::deque<uint64_t> suspectedTimes; // game thread only
+std::atomic<bool> beDegraded{false};
+std::atomic<uint64_t> suspectedKicks{0}, normalKicks{0}, heldForRecheck{0}, reregistrations{0}, passedAfterRecheck{0},
+    gaveUp{0}, droppedRechecks{0}, recheckErrors{0}, joinChecksPassed{0}, lastStepUs{0}, maxStepUs{0};
+std::atomic<uint64_t> lastSuspectedUtcMs{0}, lastDegradedUtcMs{0}, lastRecoveredUtcMs{0}, startedUtcMs{0};
+std::mutex eventMutex;
+std::deque<std::string> recentEvents; // JSON lines
+std::string recheckProblem;           // set once at startup
+
+uint64_t UtcMs() {
+    FILETIME t{};
+    GetSystemTimeAsFileTime(&t);
+    return ((static_cast<uint64_t>(t.dwHighDateTime) << 32 | t.dwLowDateTime) - 116444736000000000ull) / 10000;
+}
+uint64_t Microseconds() {
+    static LARGE_INTEGER frequency = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return f;
+    }();
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    return static_cast<uint64_t>(now.QuadPart * 1000000 / frequency.QuadPart);
+}
+std::string JsonText(const std::string &text) {
+    std::string out = "\"";
+    for (unsigned char c : text) {
+        if (c == '"' || c == '\\')
+            out += '\\', out += static_cast<char>(c);
+        else if (c < 0x20) {
+            char buffer[8];
+            sprintf_s(buffer, "\\u%04x", c);
+            out += buffer;
+        } else
+            out += static_cast<char>(c);
+    }
+    return out + "\"";
+}
+// One monitor event: a log line, a line in BattlEyeFix.events.jsonl, and the status file's recent list.
+// `fields` is a JSON fragment such as "\"player\":3,\"attempt\":1".
+void Event(const std::string &kind, const std::string &fields, const std::string &line) {
+    Write("BattlEye " + kind + ": " + line);
+    auto json = "{\"atUtcMs\":" + std::to_string(UtcMs()) + ",\"kind\":" + JsonText(kind) +
+                (fields.empty() ? "" : "," + fields) + "}";
+    Log(directory, "BattlEyeFix.events.jsonl", json);
+    std::lock_guard<std::mutex> lock(eventMutex);
+    recentEvents.push_back(json);
+    if (recentEvents.size() > 50)
+        recentEvents.pop_front();
+}
+// Worker thread, every 5 s.
+void ReadSettings() {
+    RecheckSettings s;
+    std::ifstream file(directory / L"BattlEyeFix.recheck");
+    if (file) {
+        s.hold = true;
+        std::string line;
+        while (std::getline(file, line)) {
+            auto eq = line.find('=');
+            if (eq == std::string::npos)
+                continue;
+            auto key = line.substr(0, eq);
+            key.erase(std::remove_if(key.begin(), key.end(), [](unsigned char c) { return std::isspace(c); }),
+                      key.end());
+            long long value = 0;
+            try {
+                value = std::stoll(line.substr(eq + 1));
+            } catch (...) {
+                continue;
+            }
+            auto set = [&](int &field, long long lo, long long hi) {
+                if (value >= lo && value <= hi)
+                    field = static_cast<int>(value);
+            };
+            if (key == "hold")
+                s.hold = value != 0;
+            else if (key == "minReplyBytes")
+                set(s.minReplyBytes, 1, 65536);
+            else if (key == "replyWindowMs")
+                set(s.replyWindowMs, 100, 60000);
+            else if (key == "firstCheckSeconds")
+                set(s.firstCheckSeconds, 10, 3600);
+            else if (key == "retrySeconds")
+                set(s.retrySeconds, 5, 3600);
+            else if (key == "holdSeconds")
+                set(s.holdSeconds, 10, 86400);
+            else if (key == "degradedKicks")
+                set(s.degradedKicks, 1, 1000);
+            else if (key == "degradedWindowSeconds")
+                set(s.degradedWindowSeconds, 30, 86400);
+            else if (key == "notify")
+                s.notify = value != 0;
+        }
+    }
+    std::lock_guard<std::mutex> lock(settingsMutex);
+    settings = s;
+}
+// Worker thread, every 5 s: BattlEyeFix.status.json, replaced in one step so a reader never sees half a file.
+void WriteStatus() {
+    auto s = CurrentSettings();
+    std::ostringstream o;
+    o << "{\n  \"updatedUtcMs\": " << UtcMs() << ",\n  \"startedUtcMs\": " << startedUtcMs
+      << ",\n  \"monitor\": " << (beReceivedSlot ? "true" : "false")
+      << ",\n  \"problem\": " << JsonText(recheckProblem)
+      << ",\n  \"tracking\": " << (originalBeReceived ? "true" : "false")
+      << ",\n  \"battlEye\": " << JsonText(beDegraded ? "degraded" : "healthy")
+      << ",\n  \"recheck\": " << (s.hold ? "true" : "false") << ",\n  \"settings\": {\"minReplyBytes\": "
+      << s.minReplyBytes << ", \"replyWindowMs\": " << s.replyWindowMs << ", \"firstCheckSeconds\": "
+      << s.firstCheckSeconds << ", \"retrySeconds\": " << s.retrySeconds << ", \"holdSeconds\": " << s.holdSeconds
+      << ", \"degradedKicks\": " << s.degradedKicks << ", \"degradedWindowSeconds\": " << s.degradedWindowSeconds
+      << "},\n  \"counts\": {\"suspectedFalseKicks\": " << suspectedKicks << ", \"normalKicks\": " << normalKicks
+      << ", \"held\": " << heldForRecheck << ", \"reregistrations\": " << reregistrations
+      << ", \"passedAfterRecheck\": " << passedAfterRecheck << ", \"gaveUp\": " << gaveUp
+      << ", \"dropped\": " << droppedRechecks << ", \"errors\": " << recheckErrors
+      << ", \"joinChecksPassed\": " << joinChecksPassed << "},\n  \"lastSuspectedUtcMs\": " << lastSuspectedUtcMs
+      << ",\n  \"lastDegradedUtcMs\": " << lastDegradedUtcMs << ",\n  \"lastRecoveredUtcMs\": " << lastRecoveredUtcMs
+      << ",\n  \"lastStepUs\": " << lastStepUs << ",\n  \"maxStepUs\": " << maxStepUs << ",\n  \"recent\": [";
+    {
+        std::lock_guard<std::mutex> lock(eventMutex);
+        bool first = true;
+        for (auto &e : recentEvents) {
+            o << (first ? "\n    " : ",\n    ") << e;
+            first = false;
+        }
+    }
+    o << "\n  ]\n}\n";
+    auto text = o.str();
+    auto temp = directory / L"BattlEyeFix.status.json.tmp";
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        out << text;
+    }
+    MoveFileExW(temp.c_str(), (directory / L"BattlEyeFix.status.json").c_str(), MOVEFILE_REPLACE_EXISTING);
+}
+// Every `call qword ptr [rip+X]` with X == slot.
+std::vector<uintptr_t> CallsThroughSlot(uintptr_t slot) {
+    std::vector<uintptr_t> found;
+    for (auto section : engine.sections) {
+        if (!section.executable)
+            continue;
+        std::vector<unsigned char> code(section.size);
+        if (!Read(section.address, code.data(), code.size()))
+            continue;
+        for (size_t i = 0; i + 6 <= code.size(); ++i) {
+            if (code[i] != 0xff || code[i + 1] != 0x15)
+                continue;
+            int32_t displacement{};
+            memcpy(&displacement, &code[i + 2], 4);
+            if (section.address + i + 6 + displacement == slot)
+                found.push_back(section.address + i);
+        }
+    }
+    return found;
+}
+uintptr_t FunctionOf(uintptr_t code) {
+    DWORD64 base{};
+    auto entry = RtlLookupFunctionEntry(code, &base, nullptr);
+    if (!entry || base != engine.imageBase)
+        return 0;
+    return base + entry->BeginAddress;
+}
+// A reflected field by name, searching the object's class and its parents.
+Property Member(uintptr_t object, const std::string &name) {
+    std::set<uintptr_t> seen;
+    for (auto klass = Get<uintptr_t>(object + 0x10); klass && seen.size() < 128 && seen.insert(klass).second;
+         klass = Get<uintptr_t>(klass + 0x40))
+        for (auto &p : Fields(klass))
+            if (p.name == name)
+                return p;
+    Fail("member_not_found:" + name);
+}
+// Finds every piece and checks it against the code, so a game update leaves the monitor off.
+void FindBattlEyeInterface() {
+    const std::wstring text = L"BattlEyeServer: ServerOnReceivePacket with %u bytes from player %d";
+    std::vector<unsigned char> pattern(reinterpret_cast<const unsigned char *>(text.c_str()),
+                                       reinterpret_cast<const unsigned char *>(text.c_str()) +
+                                           (text.size() + 1) * sizeof(wchar_t));
+    auto strings = FindInSections(pattern, false);
+    if (strings.size() != 1)
+        Fail("receive_text_matches:" + std::to_string(strings.size()));
+    std::vector<unsigned char> pointer(8);
+    memcpy(pointer.data(), &strings[0], 8);
+    std::set<uintptr_t> functions;
+    for (auto record : FindInSections(pointer, false))
+        for (auto lea : LeaRcxTo(record))
+            if (auto f = FunctionOf(lea))
+                functions.insert(f);
+    if (functions.size() != 1)
+        Fail("receive_function_matches:" + std::to_string(functions.size()));
+    auto receive = *functions.begin();
+    auto code = FunctionCode(receive);
+    std::set<uintptr_t> slots;
+    for (size_t i = 0; i + 6 <= code.size(); ++i)
+        if (code[i] == 0xff && code[i + 1] == 0x15) {
+            int32_t displacement{};
+            memcpy(&displacement, &code[i + 2], 4);
+            slots.insert(receive + i + 6 + displacement);
+        }
+    if (slots.size() != 1 || !InWritableData(*slots.begin()))
+        Fail("received_slot_matches:" + std::to_string(slots.size()));
+    auto received = *slots.begin();
+    auto addPlayer = received - 0x20, status = received - 0x18;
+    std::set<uintptr_t> registers;
+    for (auto call : CallsThroughSlot(addPlayer))
+        if (auto f = FunctionOf(call))
+            registers.insert(f);
+    if (registers.size() != 1)
+        Fail("register_matches:" + std::to_string(registers.size()));
+    if (!CodeMatches(*registers.begin(), {0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89,
+                                          0x7c, 0x24, 0x20, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57}))
+        Fail("register_prologue_mismatch");
+    std::set<uintptr_t> unregisters;
+    for (auto call : CallsThroughSlot(status)) {
+        unsigned char before[7]{};
+        if (Read(call - 7, before, 7) && before[0] == 0xba && before[1] == 0xff && before[2] == 0xff &&
+            before[3] == 0xff && before[4] == 0xff && before[5] == 0x8b && before[6] == 0xcf)
+            if (auto f = FunctionOf(call))
+                unregisters.insert(f);
+    }
+    if (unregisters.size() != 1)
+        Fail("unregister_matches:" + std::to_string(unregisters.size()));
+    auto unregister = *unregisters.begin();
+    if (!CodeMatches(unregister, {0x48, 0x89, 0x5c, 0x24, 0x18, 0x56, 0x57, 0x41, 0x56, 0x48, 0x83, 0xec, 0x20, 0x48,
+                                  0x8b, 0xd9}))
+        Fail("unregister_prologue_mismatch");
+    uintptr_t uniqueSet = 0;
+    auto unregisterCode = FunctionCode(unregister);
+    for (size_t i = 0; i + 7 <= unregisterCode.size() && !uniqueSet; ++i)
+        if (unregisterCode[i] == 0x48 && unregisterCode[i + 1] == 0x8d && unregisterCode[i + 2] == 0x0d) {
+            int32_t displacement{};
+            memcpy(&displacement, &unregisterCode[i + 3], 4);
+            if (InWritableData(unregister + i + 7 + displacement))
+                uniqueSet = unregister + i + 7 + displacement;
+        }
+    if (!uniqueSet)
+        Fail("unique_set_not_found");
+    std::set<uintptr_t> adders;
+    for (auto lea : LeaRcxTo(uniqueSet))
+        if (auto f = FunctionOf(lea); f && f != *registers.begin() && f != unregister &&
+                                      CodeMatches(f, {0x48, 0x89, 0x5c, 0x24, 0x18, 0x48, 0x89, 0x54, 0x24, 0x10, 0x55,
+                                                      0x56, 0x57, 0x48, 0x83, 0xec, 0x30, 0x48, 0x8b, 0xf9}))
+            adders.insert(f);
+    if (adders.size() != 1)
+        Fail("unique_adder_matches:" + std::to_string(adders.size()));
+    beReceivedSlot = received;
+    beAddPlayerSlot = addPlayer;
+    beRegister = reinterpret_cast<BeRegister>(*registers.begin());
+    beUnregister = reinterpret_cast<BeUnregister>(unregister);
+    beAddUniqueId = reinterpret_cast<BeAddUniqueId>(*adders.begin());
+    Write("BattlEye interface found: received slot " + Hex(received - engine.imageBase) + ", register " +
+          Hex(*registers.begin() - engine.imageBase) + ", unregister " + Hex(unregister - engine.imageBase) +
+          ", login step " + Hex(*adders.begin() - engine.imageBase));
+}
+// Game thread: every packet a player's BattlEye sends.
+void BeReceivedHook(int player, const void *data, int size) {
+    auto &trace = beTraces[player];
+    // The first player after BattlEye loads is registered before this hook goes in; their first packet (about
+    // 2 s later) stands in for the join time.
+    if (!trace.registeredAt)
+        trace.registeredAt = GetTickCount64();
+    ++trace.packets;
+    if (size > 2) { // 2-byte packets are acknowledgements
+        trace.lastReplyAt = GetTickCount64();
+        trace.lastReplyBytes = size;
+        trace.largestReply = std::max(trace.largestReply, size);
+    }
+    originalBeReceived(player, data, size);
+}
+void BeAddPlayerHook(int player, unsigned long address, unsigned short port, const char *name) {
+    beTraces[player] = BeTrace{GetTickCount64()};
+    if (beRegistering) {
+        beRegistering->pid = player;
+        beRegistering->registered = true;
+    }
+    originalBeAddPlayer(player, address, port, name);
+}
+// Game thread: BattlEye fills its table when it loads, at the first player's join.
+void InstallTableHooks() {
+    auto received = reinterpret_cast<volatile uintptr_t *>(beReceivedSlot);
+    auto added = reinterpret_cast<volatile uintptr_t *>(beAddPlayerSlot);
+    // BattlEye's own code lives in its own module, never in the game's image.
+    if (*received && *received != reinterpret_cast<uintptr_t>(&BeReceivedHook) &&
+        !InExecutableSection(*received, true)) {
+        originalBeReceived = reinterpret_cast<BeReceivedPacket>(*received);
+        *received = reinterpret_cast<uintptr_t>(&BeReceivedHook);
+        Write("BattlEye monitor: packet tracking on");
+    }
+    if (*added && *added != reinterpret_cast<uintptr_t>(&BeAddPlayerHook) && !InExecutableSection(*added, true)) {
+        originalBeAddPlayer = reinterpret_cast<BeAddPlayer>(*added);
+        *added = reinterpret_cast<uintptr_t>(&BeAddPlayerHook);
+        Write("BattlEye monitor: registration tracking on");
+    }
+}
+// Game thread, from the kick callback before the kick runs. True when this kick should be held for a re-check.
+bool ClassifyKick(int player, const std::string &reason) {
+    if (!beReceivedSlot)
+        return false;
+    auto s = CurrentSettings();
+    auto now = GetTickCount64();
+    auto found = beTraces.find(player);
+    BeTrace trace = found != beTraces.end() ? found->second : BeTrace{};
+    if (found != beTraces.end())
+        found->second.kicked = true;
+    bool traced = trace.registeredAt != 0;
+    long long sinceRegister = traced ? static_cast<long long>(now - trace.registeredAt) : -1;
+    long long sinceReply = trace.lastReplyAt ? static_cast<long long>(now - trace.lastReplyAt) : -1;
+    bool notResponding = reason.find("not responding") != std::string::npos;
+    bool answered = trace.lastReplyAt && trace.lastReplyBytes >= s.minReplyBytes && sinceReply <= s.replyWindowMs;
+    bool joinCheck = traced && sinceRegister <= static_cast<long long>(s.firstCheckSeconds) * 1000;
+    bool suspected = notResponding && answered && joinCheck;
+    auto fields = "\"player\":" + std::to_string(player) + ",\"reason\":" + JsonText(reason) +
+                  ",\"msSinceRegister\":" + std::to_string(sinceRegister) +
+                  ",\"msSinceReply\":" + std::to_string(sinceReply) +
+                  ",\"lastReplyBytes\":" + std::to_string(trace.lastReplyBytes) +
+                  ",\"packets\":" + std::to_string(trace.packets) + ",\"suspectedFalse\":" + (suspected ? "true" : "false");
+    auto line = "player " + std::to_string(player) + " (" + reason + "), " +
+                (traced ? std::to_string(sinceRegister) + " ms after joining" : "join not traced") + ", last reply " +
+                (trace.lastReplyAt ? std::to_string(trace.lastReplyBytes) + " bytes " + std::to_string(sinceReply) +
+                                         " ms before"
+                                   : "none");
+    if (!suspected) {
+        ++normalKicks;
+        Event("kick", fields, line + ": normal kick");
+        return false;
+    }
+    ++suspectedKicks;
+    lastSuspectedUtcMs = UtcMs();
+    suspectedTimes.push_back(now);
+    while (!suspectedTimes.empty() && now - suspectedTimes.front() > static_cast<uint64_t>(s.degradedWindowSeconds) * 1000)
+        suspectedTimes.pop_front();
+    Event("suspected false kick", fields,
+          line + ": the player's BattlEye answered, so BattlEye's verdict looks wrong" +
+              (s.hold ? "" : " (re-check off, kicking as normal)"));
+    if (!beDegraded && static_cast<int>(suspectedTimes.size()) >= s.degradedKicks) {
+        beDegraded = true;
+        lastDegradedUtcMs = UtcMs();
+        Event("degraded",
+              "\"suspectedKicks\":" + std::to_string(suspectedTimes.size()) +
+                  ",\"windowSeconds\":" + std::to_string(s.degradedWindowSeconds),
+              std::to_string(suspectedTimes.size()) + " suspected false kicks in " +
+                  std::to_string(s.degradedWindowSeconds) + " s: BattlEye's checks look broken");
+    }
+    if (!s.hold || !beRegister || !beUnregister || !beAddUniqueId || !originalKickPlayer)
+        return false;
+    for (auto &item : rechecks)
+        if (item.pid == player && now - item.firstAt > static_cast<uint64_t>(s.holdSeconds) * 1000) {
+            ++gaveUp;
+            Event("re-check gave up", "\"player\":" + std::to_string(player) + ",\"attempts\":" + std::to_string(item.attempts),
+                  "player " + std::to_string(player) + " still failing after " + std::to_string(item.attempts) +
+                      " re-check(s) and " + std::to_string(s.holdSeconds) + " s, kicking");
+            item.pid = -2; // removed by the tick
+            return false;
+        }
+    return true;
+}
+// Game thread, from KickPlayerHook during a suspected kick: hold the player instead of kicking.
+void HoldForRecheck(void *controller, int player) {
+    auto s = CurrentSettings();
+    auto handle = Ref(reinterpret_cast<uintptr_t>(controller));
+    for (auto &item : rechecks)
+        if (item.pid == player || (item.controller.index == handle.index && item.controller.serial == handle.serial)) {
+            item.unregistered = item.registered = false; // failed again: next attempt from this registration
+            item.pid = player;
+            return;
+        }
+    if (rechecks.size() >= 64)
+        Fail("too_many_rechecks");
+    Recheck item;
+    item.controller = handle;
+    item.pid = player;
+    item.firstAt = GetTickCount64();
+    rechecks.push_back(item);
+    ++heldForRecheck;
+    if (s.notify)
+        try {
+            SendMessageBox(reinterpret_cast<uintptr_t>(controller), "BattlEye check failed on BattlEye's side",
+                           "BattlEye's servers rejected a normal check (\"Client not responding\"). This happens to "
+                           "many players when BattlEye is having problems.\n\nYou won't be kicked for now. The server "
+                           "will ask BattlEye to check you again in about " +
+                               std::to_string(s.retrySeconds) + " seconds. You don't need to do anything.");
+        } catch (...) {
+        }
+}
+// ConanSandbox players, by the unique net id the game's BattlEye functions take.
+const void *UniqueIdOf(uintptr_t controller) {
+    auto statePointer = Member(controller, "PlayerState");
+    if (statePointer.type != "ObjectProperty")
+        Fail("player_state_type:" + statePointer.type);
+    auto state = Get<uintptr_t>(controller + statePointer.offset);
+    if (!state)
+        Fail("no_player_state");
+    RequireClass(state, "PlayerState");
+    auto unique = Member(state, "UniqueID"); // FUniqueNetIdRepl, 48 bytes in this build
+    if (unique.type != "StructProperty" || unique.size != 48)
+        Fail("unique_id_layout:" + unique.type + "/" + std::to_string(unique.size));
+    return reinterpret_cast<const void *>(state + unique.offset);
+}
+template <class Step> uint64_t Timed(Step step) {
+    auto began = Microseconds();
+    step();
+    auto spent = Microseconds() - began;
+    lastStepUs = spent;
+    if (spent > maxStepUs)
+        maxStepUs = spent;
+    return spent;
+}
+// Game thread, every tick while there is anything to do.
+void RecheckTick() {
+    InstallTableHooks();
+    auto s = CurrentSettings();
+    auto now = GetTickCount64();
+    for (auto it = beTraces.begin(); it != beTraces.end();) {
+        auto &trace = it->second;
+        if (!trace.passed && !trace.kicked && trace.registeredAt &&
+            now - trace.registeredAt > static_cast<uint64_t>(s.firstCheckSeconds) * 1000) {
+            trace.passed = true;
+            if (trace.largestReply >= s.minReplyBytes) {
+                ++joinChecksPassed;
+                for (auto &item : rechecks)
+                    if (item.pid == it->first) {
+                        ++passedAfterRecheck;
+                        Event("re-check passed",
+                              "\"player\":" + std::to_string(it->first) + ",\"attempts\":" + std::to_string(item.attempts),
+                              "player " + std::to_string(it->first) + " passed BattlEye's check after " +
+                                  std::to_string(item.attempts) + " re-check(s), protected again");
+                        item.pid = -3;
+                    }
+                if (beDegraded) {
+                    beDegraded = false;
+                    lastRecoveredUtcMs = UtcMs();
+                    suspectedTimes.clear();
+                    Event("recovered", "\"player\":" + std::to_string(it->first),
+                          "a player passed BattlEye's join check again");
+                }
+            }
+        }
+        if (trace.kicked || (trace.passed && now - trace.registeredAt > 3600000))
+            it = beTraces.erase(it);
+        else
+            ++it;
+    }
+    for (auto it = rechecks.begin(); it != rechecks.end();) {
+        if (it->pid == -2 || it->pid == -3) {
+            it = rechecks.erase(it);
+            continue;
+        }
+        try {
+            auto controller = Resolve(it->controller);
+            if (!it->unregistered) {
+                auto id = UniqueIdOf(controller);
+                auto spent = Timed([&] { beUnregister(id); });
+                it->unregistered = true;
+                it->unregisteredAt = now;
+                Write("BattlEye re-check: player taken off BattlEye in " + std::to_string(spent) +
+                      " us, registering again in " + std::to_string(s.retrySeconds) + " s");
+            } else if (!it->registered && now - it->unregisteredAt >= static_cast<uint64_t>(s.retrySeconds) * 1000) {
+                auto id = UniqueIdOf(controller);
+                beRegistering = &*it;
+                auto spent = Timed([&] {
+                    // Put back the login entry unregister removed (so the next unregister, or the player's
+                    // logout, finds them), then register as the game does when a player possesses a character.
+                    beAddUniqueId(id, reinterpret_cast<void *>(controller));
+                    beRegister(reinterpret_cast<void *>(controller));
+                });
+                beRegistering = nullptr;
+                ++it->attempts;
+                ++reregistrations;
+                if (!it->registered)
+                    Fail("register_did_not_add_player");
+                Event("re-registered",
+                      "\"player\":" + std::to_string(it->pid) + ",\"attempt\":" + std::to_string(it->attempts) +
+                          ",\"us\":" + std::to_string(spent),
+                      "registered again as player " + std::to_string(it->pid) + " in " + std::to_string(spent) +
+                          " us (attempt " + std::to_string(it->attempts) + "), waiting for a fresh check");
+            }
+            ++it;
+        } catch (const std::exception &e) {
+            beRegistering = nullptr;
+            std::string why = e.what();
+            if (why.find("stale_object_handle") != std::string::npos || why.find("object_pending_gc") != std::string::npos) {
+                ++droppedRechecks;
+                Write("BattlEye re-check dropped: the player left");
+            } else {
+                ++recheckErrors;
+                Write("BattlEye re-check failed, dropping it: " + why);
+            }
+            it = rechecks.erase(it);
+        }
+    }
+}
+bool RecheckBusy() {
+    return beReceivedSlot && (!originalBeReceived || !originalBeAddPlayer || !beTraces.empty() || !rechecks.empty());
+}
+
 // ProcessEvent passes straight through; actor ticks on the game thread drive the held kicks.
 void EventHook(void *object, void *function, void *parameters) {
     thread_local int depth = 0;
     ++depth;
     originalEvent(object, function, parameters);
     --depth;
-    if (!depth && function && GetCurrentThreadId() == gameThreadId && !heldKicks.empty() &&
+    if (!depth && function && GetCurrentThreadId() == gameThreadId && (!heldKicks.empty() || RecheckBusy()) &&
         *reinterpret_cast<const uint32_t *>(reinterpret_cast<uintptr_t>(function) + 0x18) == receiveTickName &&
-        OnGameThread())
-        HeldKickTick();
+        OnGameThread()) {
+        if (!heldKicks.empty())
+            HeldKickTick();
+        // ReceiveTick runs for many actors per frame; the re-check runs at most every 50 ms.
+        static uint64_t lastRecheck = 0;
+        auto now = GetTickCount64();
+        if (RecheckBusy() && now - lastRecheck >= 50) {
+            lastRecheck = now;
+            RecheckTick();
+        }
+    }
 }
 // Worker thread: once the world is up, confirms the guard can work and hooks KickPlayer for the message.
 void ReportReady() {
@@ -1140,6 +1735,18 @@ DWORD WINAPI Run(void *) {
             MH_EnableHook(reinterpret_cast<void *>(battlEyeKickCode)) != MH_OK)
             Fail("battleye_kick_hook_failed");
         Write("Guard armed: a BattlEye kick can no longer crash the server");
+        startedUtcMs = UtcMs();
+        ReadSettings();
+        try {
+            FindBattlEyeInterface();
+            Write(std::string("BattlEye monitor armed; re-check ") +
+                  (CurrentSettings().hold ? "on: suspected false kicks are held and re-checked"
+                                          : "off (create BattlEyeFix.recheck to turn it on)"));
+        } catch (const std::exception &e) {
+            recheckProblem = e.what();
+            beReceivedSlot = 0;
+            Write(std::string("BattlEye monitor off: ") + e.what());
+        }
         try {
             receiveTickName = Get<uint32_t>(FindFunction(Class("Actor"), "ReceiveTick").address + 0x18);
             if (MH_CreateHook(reinterpret_cast<void *>(engine.processEvent), reinterpret_cast<void *>(&EventHook),
@@ -1155,6 +1762,13 @@ DWORD WINAPI Run(void *) {
         for (uint64_t tick = 0;; ++tick) {
             Sleep(250);
             noticeOff = FileExists(L"BattlEyeFix.notice-off");
+            if (tick % 20 == 0) {
+                ReadSettings();
+                try {
+                    WriteStatus();
+                } catch (...) {
+                }
+            }
             if (tick % 40 == 20)
                 try {
                     RefreshInstance();
