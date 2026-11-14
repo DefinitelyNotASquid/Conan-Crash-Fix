@@ -102,6 +102,8 @@ A "Query Timeout" kick means BattlEye on the player's own PC stopped responding.
 3. Verifying the game files in Steam.
 4. Making sure a firewall or antivirus isn't blocking BattlEye.
 
+<img width="1201" height="684" alt="image" src="https://github.com/user-attachments/assets/d6848ae0-58d7-42fa-9b6f-300a68cadcca" />
+
 ## Building from source
 
 | Path | What it is |
