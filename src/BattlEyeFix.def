@@ -1,0 +1,22 @@
+LIBRARY winmm
+EXPORTS
+    timeGetTime=ProxyTimeGetTime
+    timeBeginPeriod=ProxyTimeBeginPeriod
+    timeEndPeriod=ProxyTimeEndPeriod
+    waveOutGetDevCapsW=Proxy_waveOutGetDevCapsW
+    mixerSetControlDetails=Proxy_mixerSetControlDetails
+    mixerGetControlDetailsA=Proxy_mixerGetControlDetailsA
+    mixerGetLineControlsA=Proxy_mixerGetLineControlsA
+    mixerGetID=Proxy_mixerGetID
+    mixerGetLineInfoA=Proxy_mixerGetLineInfoA
+    mixerClose=Proxy_mixerClose
+    mixerOpen=Proxy_mixerOpen
+    mixerGetDevCapsA=Proxy_mixerGetDevCapsA
+    waveInMessage=Proxy_waveInMessage
+    waveInClose=Proxy_waveInClose
+    waveInOpen=Proxy_waveInOpen
+    waveOutMessage=Proxy_waveOutMessage
+    waveOutClose=Proxy_waveOutClose
+    waveOutOpen=Proxy_waveOutOpen
+    timeKillEvent=Proxy_timeKillEvent
+    timeSetEvent=Proxy_timeSetEvent

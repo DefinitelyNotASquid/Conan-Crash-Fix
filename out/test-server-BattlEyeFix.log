@@ -1,0 +1,9 @@
+2026-11-14T02:43:33Z pid=19132 BattlEyeFix starting
+2026-11-14T02:44:05Z pid=19132 Engine found: names 0xa901900, objects 0xa9d06c0, ProcessEvent 0x1646ba0
+2026-11-14T02:44:07Z pid=19132 BattlEye kick callback found at 0x4d06360, game-instance pointer at 0xaba2518 (null, so kicks would crash)
+2026-11-14T02:44:08Z pid=19132 Guard armed: a BattlEye kick can no longer crash the server
+2026-11-14T02:44:13Z pid=19132 Guard ready: game instance > world > ConanGameMode > GameSession validated
+2026-11-14T02:44:13Z pid=19132 Kick message armed: players see why, then are kicked 3 s later
+2026-11-14T02:48:35Z pid=19132 Kick message shown, kick follows in 3 s
+2026-11-14T02:48:35Z pid=19132 BattlEye kick of player 0 (Client not responding): kicked safely
+2026-11-14T02:48:38Z pid=19132 Held kick done (Client not responding)
